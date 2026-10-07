@@ -258,6 +258,10 @@ GARNA_STORE = ('(()=>{try{const st=document.querySelector("#__nuxt").__vue_app__
                'amount:x.items_sum_amount,at:x.created_at}))):null}catch(e){return null}})()')
 
 
+GARNA_AUTHED = ('(()=>{try{return !location.pathname.startsWith("/auth/")&&!!document.querySelector("#__nuxt")'
+                '.__vue_app__.config.globalProperties.$pinia.state.value.auth.user}catch(e){return false}})()')
+
+
 def garna_session(debug_dir):
     b = Browser(debug_dir)
     b.go(GARNA_PAGE, wait=3)
@@ -269,7 +273,8 @@ def garna_session(debug_dir):
     w = Browser(debug_dir, visible=True)
     try:
         w.go(GARNA_PAGE, wait=1)
-        w.wait(GARNA_STORE, timeout=600, what="вход в Garna в окне Chrome")
+        w.wait(GARNA_AUTHED, timeout=600, what="вход в Garna в окне Chrome")
+        w.pump(2)
     finally:
         w.close()
     b = Browser(debug_dir)
