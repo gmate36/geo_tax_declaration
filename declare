@@ -359,13 +359,23 @@ def rs_read_mandatory(b):
             return
 
 
+def rs_english(b):
+    b.go("https://eservices.rs.ge/MainPage.aspx", wait=2)
+    b.js('(()=>{const e=[...document.querySelectorAll("body *")].filter(x=>x.offsetParent&&x.children.length===0&&'
+         '/^english version$/i.test((x.innerText||"").trim()));e.length&&e[0].click()})()')
+    b.pump(4)
+
+
 def rs_open_small_business(b):
     b.go(RS_DECL, wait=4)
     if "decl.rs.ge" not in b.url():
-        b.snap("rs-decl")
         raise Fail("rs.ge не пустил в декларации: зайди на eservices.rs.ge и прочитай обязательные уведомления")
+    b.wait('typeof go_g3==="function"', timeout=30, what="раздел деклараций")
     b.js(f'go_g3("{SMALL_BUSINESS}","1")')
-    b.pump(4)
+    b.wait('[...document.querySelectorAll("li,div,a,input,button")].some(x=>x.offsetParent&&x.children.length<=2&&'
+           '((x.value||"")+(x.innerText||"")).trim()==="new return")', timeout=30,
+           what="список деклараций малого бизнеса")
+    b.pump(2)
 
 
 def rs_rows(b):
@@ -375,9 +385,8 @@ def rs_rows(b):
         'return {status:td[1],assessment:td[2],seq:td[4],reg:td[5],sent:td[6]}})))()'))
 
 
-def rs_period_label(b):
-    return b.js('(()=>{const s=[...document.querySelectorAll("input")].find(i=>i.offsetParent&&'
-                '/\\b(19|20)\\d\\d$/.test(i.value)&&/[A-Za-z]/.test(i.value));return s?s.value:null})()')
+def rs_form_period(b):
+    return b.js('(()=>{const m=document.body.innerText.match(/(20\\d\\d)\\/(\\d\\d)/);return m?m[1]+"-"+m[2]:null})()')
 
 
 def rs_payer_name(b, tin):
@@ -492,10 +501,8 @@ def run(args):
         say("rs.ge: вход...")
         tin = rs_login(b)
         rs_read_mandatory(b)
+        rs_english(b)
         rs_open_small_business(b)
-        period = rs_period_label(b)
-        if period != label:
-            raise Fail(f"rs.ge предлагает период {period}, а считаем {label}")
         rows = rs_rows(b)
         sent = [r for r in rows if r["reg"]]
         payer = rs_payer_name(b, tin)
@@ -512,6 +519,9 @@ def run(args):
             b.pump(4)
             seq = b.wait('(()=>{const m=document.body.innerText.match(/N:(\\d{6,})/);return m?m[1]:null})()',
                          what="номер декларации")
+            period = rs_form_period(b)
+            if period != f"{year}-{month:02d}":
+                raise Fail(f"rs.ge открыл декларацию за {period}, а считаем {year}-{month:02d}")
             got = rs_fill(b, income_gel)
             b.snap("rs-form")
             say(f"К подаче за {label}:")
@@ -544,6 +554,9 @@ def run(args):
         pdf = os.path.join(folder, f"declaration-{year}-{month:02d}.pdf")
         rs_print(b, seq, pdf)
         say(f"PDF декларации: {pdf}")
+    except Fail:
+        b.snap("error")
+        raise
     finally:
         b.close()
 
