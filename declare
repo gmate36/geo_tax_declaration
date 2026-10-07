@@ -126,7 +126,7 @@ class WS:
 
 
 class Browser:
-    def __init__(self, debug_dir=None):
+    def __init__(self, debug_dir=None, visible=False):
         if not os.path.exists(CHROME):
             raise Fail("нужен Google Chrome в /Applications")
         os.makedirs(PROFILE, exist_ok=True)
@@ -134,10 +134,11 @@ class Browser:
         if os.path.exists(port_file):
             os.remove(port_file)
         self.debug_dir = debug_dir
+        mode = [] if visible else ["--headless=new", "--disable-gpu"]
         self.proc = subprocess.Popen(
-            [CHROME, "--headless=new", "--remote-debugging-port=0", "--remote-allow-origins=*",
+            [CHROME, *mode, "--remote-debugging-port=0", "--remote-allow-origins=*",
              f"--user-data-dir={PROFILE}", "--no-first-run", "--no-default-browser-check",
-             "--disable-gpu", "--window-size=1400,1000", "about:blank"],
+             "--window-size=1400,1000", "about:blank"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(150):
             if os.path.exists(port_file):
@@ -232,12 +233,6 @@ class Browser:
         self.js(f"(()=>{{const e=document.querySelector({json.dumps(selector)});e.focus();e.select&&e.select()}})()")
         self.send("Input.insertText", {"text": text})
 
-    def key(self, name):
-        codes = {"Enter": 13, "Tab": 9}
-        for kind in ("keyDown", "keyUp"):
-            self.send("Input.dispatchKeyEvent", {"type": kind, "key": name, "code": name,
-                                                 "windowsVirtualKeyCode": codes[name]})
-
     def snap(self, name):
         if not self.debug_dir:
             return
@@ -263,37 +258,28 @@ GARNA_STORE = ('(()=>{try{const st=document.querySelector("#__nuxt").__vue_app__
                'amount:x.items_sum_amount,at:x.created_at}))):null}catch(e){return null}})()')
 
 
-def garna_login(b):
-    email, password = credentials("declare-garna", "Garna", "Почта для входа в Garna")
-    b.wait('document.querySelector("input[name=email]")', what="форму входа Garna")
-    b.type_into("input[name=email]", email)
-    b.type_into("input[name=password]", password)
-    b.js('document.getElementById("test--signin-submit").click()')
-    b.pump(4)
-    for _ in range(3):
-        if "/auth/" not in b.url():
-            return
-        code_input = b.js('(()=>{const i=[...document.querySelectorAll("input")].filter(e=>e.offsetParent&&'
-                          '!["email","password"].includes(e.name)&&e.type!=="checkbox");if(!i.length)return null;'
-                          'i[0].setAttribute("data-declare","code");return "yes"})()')
-        if not code_input:
-            b.snap("garna-login")
-            raise Fail("Garna не пустила: проверь логин и пароль (security delete-generic-password -s declare-garna)")
-        code = ask("Garna, код двухфакторной защиты: ")
-        b.type_into('input[data-declare="code"]', code)
-        b.pump(1)
-        b.key("Enter")
-        b.pump(5)
+def garna_session(debug_dir):
+    b = Browser(debug_dir)
+    b.go(GARNA_PAGE, wait=3)
+    if "/auth/" not in b.url():
+        return b
+    b.close()
+    say("Входа в Garna ещё нет. Сейчас откроется окно Chrome - войди в Garna как обычно,")
+    say("окно закроется само. Повторять это придётся примерно раз в полгода.")
+    w = Browser(debug_dir, visible=True)
+    try:
+        w.go(GARNA_PAGE, wait=1)
+        w.wait(GARNA_STORE, timeout=600, what="вход в Garna в окне Chrome")
+    finally:
+        w.close()
+    b = Browser(debug_dir)
+    b.go(GARNA_PAGE, wait=3)
     if "/auth/" in b.url():
-        b.snap("garna-2fa")
-        raise Fail("Garna не приняла код")
+        raise Fail("Garna не сохранила вход в профиле скрипта")
+    return b
 
 
 def garna_incomes(b, year, month, folder):
-    b.go(GARNA_PAGE, wait=3)
-    if "/auth/" in b.url():
-        garna_login(b)
-        b.go(GARNA_PAGE, wait=3)
     raw = b.wait(GARNA_STORE, timeout=40, what="список поступлений Garna")
     incomes = []
     for tx in json.loads(raw):
@@ -476,10 +462,10 @@ def run(args):
     os.makedirs(folder, exist_ok=True)
     debug_dir = os.path.join(folder, "debug") if args.debug else None
 
-    b = Browser(debug_dir)
+    say(f"Декларация за {label}\n")
+    say("Garna: смотрю поступления...")
+    b = garna_session(debug_dir)
     try:
-        say(f"Декларация за {label}\n")
-        say("Garna: смотрю поступления...")
         incomes = garna_incomes(b, year, month, folder)
         if not incomes:
             say(f"За {label} поступлений в Garna нет. Нулевую декларацию скрипт не подаёт.")
