@@ -325,15 +325,15 @@ def nbg_rate(day):
 
 
 def rs_login(b):
-    tin, password = credentials("declare-rs.ge", "rs.ge", "Логин rs.ge (обычно ИНН)")
+    login, password = credentials("declare-rs.ge", "rs.ge", "Логин rs.ge")
     b.go(RS_LOGIN, wait=3)
     if "Login.aspx" not in b.url():
-        return tin
+        return
     b.js('(()=>{const t=[...document.querySelectorAll("input[type=text]")].filter(i=>i.offsetParent&&'
          '!/search/i.test(i.id+i.name));t[0].setAttribute("data-declare","login");'
          '[...document.querySelectorAll("input[type=password]")].filter(i=>i.offsetParent)[0]'
          '.setAttribute("data-declare","password")})()')
-    b.type_into('input[data-declare="login"]', tin)
+    b.type_into('input[data-declare="login"]', login)
     b.type_into('input[data-declare="password"]', password)
     b.js('document.getElementById("btnLogin").click()')
     b.wait('(()=>{const e=document.getElementById("smsText");return e&&e.offsetParent?1:0})()', timeout=20,
@@ -342,7 +342,6 @@ def rs_login(b):
     b.type_into("#smsText", code)
     b.js('document.getElementById("btnSmsLogin").click()')
     b.wait('!location.href.includes("Login.aspx")', timeout=30, what="вход в кабинет rs.ge")
-    return tin
 
 
 def rs_read_mandatory(b):
@@ -389,11 +388,12 @@ def rs_form_period(b):
     return b.js('(()=>{const m=document.body.innerText.match(/(20\\d\\d)\\/(\\d\\d)/);return m?m[1]+"-"+m[2]:null})()')
 
 
-def rs_payer_name(b, tin):
-    return b.js('(()=>{const e=[...document.querySelectorAll("body *")].filter(x=>x.offsetParent&&'
-                f'x.children.length<=3&&(x.innerText||"").trim().endsWith("{tin}")&&'
-                '(x.innerText||"").trim().split("\\n").length===2);return e.length?e[0].innerText.trim()'
-                '.split("\\n")[0].trim():null})()')
+def rs_taxpayer(b):
+    name, tin = json.loads(b.js('JSON.stringify(["Username","UserTin"].map(i=>'
+                                '((document.getElementById(i)||{}).textContent||"").trim()))'))
+    if not name or not tin:
+        raise Fail("не нашёл в кабинете rs.ge имя и налоговый номер")
+    return name, tin
 
 
 def rs_fill(b, income_gel):
@@ -475,7 +475,7 @@ def previous_month():
 
 
 def run(args):
-    year, month = (int(x) for x in args.month.split("-")) if args.month else previous_month()
+    year, month = previous_month()
     label = f"{MONTHS[month - 1]} {year}"
     folder = os.path.join(OUT_ROOT, f"{year}-{month:02d}")
     os.makedirs(folder, exist_ok=True)
@@ -499,13 +499,13 @@ def run(args):
         say(f"  итого доход {income_gel} лари, налог 1% = {tax:.2f}\n")
 
         say("rs.ge: вход...")
-        tin = rs_login(b)
+        rs_login(b)
         rs_read_mandatory(b)
         rs_english(b)
         rs_open_small_business(b)
         rows = rs_rows(b)
         sent = [r for r in rows if r["reg"]]
-        payer = rs_payer_name(b, tin)
+        payer, tin = rs_taxpayer(b)
 
         if sent:
             seq = sent[0]["seq"]
@@ -563,15 +563,13 @@ def run(args):
     note = f"{tin} small business tax for {label}"
     say("\nОплата:")
     say(f"  сумма {tax:.2f} лари, назначение: {note}")
-    if payer:
-        say(f"  ссылка: {keepz_link(tin, payer, note, tax)}")
+    say(f"  ссылка: {keepz_link(tin, payer, note, tax)}")
     say(f"\nВсё лежит в {folder}")
     return 0
 
 
 def main():
     p = argparse.ArgumentParser(prog="declare", description="Месячная декларация малого бизнеса в Грузии из Garna")
-    p.add_argument("--month", help="месяц в формате 2026-09, по умолчанию прошлый")
     p.add_argument("--dry-run", action="store_true", help="заполнить и сохранить черновик, не отправлять")
     p.add_argument("--debug", action="store_true", help="сохранять скриншоты шагов в папку месяца")
     args = p.parse_args()
