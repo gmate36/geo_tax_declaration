@@ -268,11 +268,16 @@ def garna_session(debug_dir):
     if "/auth/" not in b.url():
         return b
     b.close()
-    say("Входа в Garna ещё нет. Сейчас откроется окно Chrome - войди в Garna как обычно,")
-    say("окно закроется само. Повторять это придётся примерно раз в полгода.")
+    email, password = credentials("declare-garna", "Garna", "Почта для входа в Garna")
+    say("Сейчас откроется окно Chrome с Garna: почта и пароль уже будут вписаны, введи код 2FA.")
+    say("Окно закроется само. Повторять это придётся примерно раз в полгода.")
     w = Browser(debug_dir, visible=True)
     try:
         w.go(GARNA_PAGE, wait=1)
+        w.wait('document.querySelector("input[name=email]")', timeout=30, what="форму входа Garna")
+        w.type_into("input[name=email]", email)
+        w.type_into("input[name=password]", password)
+        w.js('document.getElementById("test--signin-submit").click()')
         w.wait(GARNA_AUTHED, timeout=600, what="вход в Garna в окне Chrome")
         w.pump(2)
     finally:
