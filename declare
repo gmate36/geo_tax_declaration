@@ -252,10 +252,14 @@ class Browser:
             self.proc.kill()
 
 
-GARNA_STORE = ('(()=>{try{const st=document.querySelector("#__nuxt").__vue_app__.config.globalProperties'
-               '.$pinia.state.value;if(!st.auth.user)return null;const l=((st.payrollUSD.transactions||{})'
-               '.transactions||{}).list;return l&&l.length?JSON.stringify(l.map(x=>({id:x.id,type:x.type,'
-               'amount:x.items_sum_amount,at:x.created_at}))):null}catch(e){return null}})()')
+GARNA_CURRENCIES = ("USD", "EUR")
+
+
+def garna_store(currency):
+    return ('(()=>{try{const st=document.querySelector("#__nuxt").__vue_app__.config.globalProperties'
+            f'.$pinia.state.value;if(!st.auth.user)return null;const l=((st.payroll{currency}.transactions||{{}})'
+            '.transactions||{}).list;return l&&l.length?JSON.stringify(l.map(x=>({id:x.id,type:x.type,'
+            'amount:x.items_sum_amount,at:x.created_at}))):null}catch(e){return null}})()')
 
 
 GARNA_AUTHED = ('(()=>{try{return !location.pathname.startsWith("/auth/")&&!!document.querySelector("#__nuxt")'
@@ -289,13 +293,25 @@ def garna_session(debug_dir):
     return b
 
 
+def garna_page(currency):
+    return f"https://app.garna.io/home/balance/payroll-account/{currency}"
+
+
 def garna_incomes(b, year, month, folder):
-    raw = b.wait(GARNA_STORE, timeout=40, what="список поступлений Garna")
     incomes = []
-    for tx in json.loads(raw):
-        at = datetime.datetime.fromisoformat(tx["at"]).astimezone(TBILISI)
-        if tx["type"] == GARNA_INCOMING and (at.year, at.month) == (year, month):
-            incomes.append({"id": tx["id"], "usd": float(tx["amount"]), "date": at.date()})
+    for currency in GARNA_CURRENCIES:
+        b.go(garna_page(currency), wait=3)
+        raw = None
+        for _ in range(30):
+            raw = b.js(garna_store(currency))
+            if raw:
+                break
+            b.pump(0.7)
+        for tx in json.loads(raw or "[]"):
+            at = datetime.datetime.fromisoformat(tx["at"]).astimezone(TBILISI)
+            if tx["type"] == GARNA_INCOMING and (at.year, at.month) == (year, month):
+                incomes.append({"id": tx["id"], "currency": currency, "amount": float(tx["amount"]),
+                                "date": at.date()})
     for inc in incomes:
         path = os.path.join(folder, f"garna-invoice-{inc['id']}.pdf")
         if os.path.exists(path):
@@ -312,16 +328,73 @@ def garna_incomes(b, year, month, folder):
     return incomes
 
 
-def nbg_rate(day):
+def nbg_rate(currency, day):
     url = ("https://nbg.gov.ge/gw/api/ct/monetarypolicy/currencies/en/json/?"
-           + urllib.parse.urlencode({"currencies": "USD", "date": day.isoformat()}))
+           + urllib.parse.urlencode({"currencies": currency, "date": day.isoformat()}))
     with urllib.request.urlopen(urllib.request.Request(url, headers={"Accept": "application/json"}),
                                 timeout=20) as r:
         data = json.load(r)
     if not data or not data[0].get("currencies"):
-        raise Fail(f"НБГ не отдал курс на {day}")
+        raise Fail(f"НБГ не знает валюту {currency} или не отдал курс на {day}")
     c = data[0]["currencies"][0]
     return c["rate"] / (c.get("quantity") or 1)
+
+
+MENU_CURRENCIES = ("USD", "EUR", "GBP")
+
+
+def ask_currency():
+    menu = "  ".join(f"{i}) {c}" for i, c in enumerate(MENU_CURRENCIES, 1))
+    while True:
+        answer = ask(f"Валюта: {menu}, или код другой валюты: ").upper()
+        if answer.isdigit() and 1 <= int(answer) <= len(MENU_CURRENCIES):
+            return MENU_CURRENCIES[int(answer) - 1]
+        if re.fullmatch(r"[A-Z]{3}", answer):
+            try:
+                nbg_rate(answer, datetime.date.today())
+                return answer
+            except Fail:
+                say(f"  НБГ не публикует курс {answer}")
+                continue
+        say("  нужна цифра из списка или трёхбуквенный код, например CHF")
+
+
+def ask_amount(currency):
+    while True:
+        answer = ask(f"Сумма в {currency}: ").replace(" ", "").replace(",", ".")
+        try:
+            value = float(answer)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+        say("  нужно число, например 4800 или 2907.13")
+
+
+def ask_date(year, month):
+    while True:
+        answer = ask("Дата поступления денег (ДД.ММ, или ДД.ММ.ГГГГ): ").strip()
+        m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?", answer)
+        if m:
+            try:
+                d = datetime.date(int(m.group(3) or year), int(m.group(2)), int(m.group(1)))
+            except ValueError:
+                d = None
+            if d and (d.year, d.month) == (year, month):
+                return d
+        say(f"  нужна дата в {MONTHS[month - 1]} {year}, например 25.{month:02d}")
+
+
+def manual_incomes(year, month):
+    say(f"Поступления за {MONTHS[month - 1]} {year}.")
+    currency = ask_currency()
+    incomes = []
+    while True:
+        amount = ask_amount(currency)
+        day = ask_date(year, month)
+        incomes.append({"currency": currency, "amount": amount, "date": day})
+        if ask("Ещё поступление в этом месяце? [y/N] ").lower() != "y":
+            return incomes
 
 
 def rs_login(b):
@@ -482,18 +555,24 @@ def run(args):
     debug_dir = os.path.join(folder, "debug") if args.debug else None
 
     say(f"Декларация за {label}\n")
-    say("Garna: смотрю поступления...")
-    b = garna_session(debug_dir)
+    if args.garna:
+        say("Garna: смотрю поступления...")
+        b = garna_session(debug_dir)
+    else:
+        incomes = manual_incomes(year, month)
+        say("")
+        b = Browser(debug_dir)
     try:
-        incomes = garna_incomes(b, year, month, folder)
-        if not incomes:
-            say(f"За {label} поступлений в Garna нет. Нулевую декларацию скрипт не подаёт.")
-            return 0
+        if args.garna:
+            incomes = garna_incomes(b, year, month, folder)
+            if not incomes:
+                say(f"За {label} поступлений в Garna нет. Нулевую декларацию скрипт не подаёт.")
+                return 0
         total_raw = 0.0
         for inc in incomes:
-            inc["rate"] = nbg_rate(inc["date"])
-            total_raw += inc["usd"] * inc["rate"]
-            say(f"  {inc['date']}: ${inc['usd']:,.2f} x курс НБГ {inc['rate']:.4f}")
+            inc["rate"] = nbg_rate(inc["currency"], inc["date"])
+            total_raw += inc["amount"] * inc["rate"]
+            say(f"  {inc['date']}: {inc['amount']:,.2f} {inc['currency']} x курс НБГ {inc['rate']:.4f}")
         income_gel = math.ceil(total_raw - 1e-9)
         tax = round(income_gel / 100, 2)
         say(f"  итого доход {income_gel} лари, налог 1% = {tax:.2f}\n")
@@ -569,7 +648,8 @@ def run(args):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="declare", description="Месячная декларация малого бизнеса в Грузии из Garna")
+    p = argparse.ArgumentParser(prog="declare", description="Месячная декларация малого бизнеса (1%%) на rs.ge")
+    p.add_argument("--garna", action="store_true", help="взять поступления и инвойсы из Garna вместо ввода руками")
     p.add_argument("--dry-run", action="store_true", help="заполнить и сохранить черновик, не отправлять")
     p.add_argument("--debug", action="store_true", help="сохранять скриншоты шагов в папку месяца")
     args = p.parse_args()
