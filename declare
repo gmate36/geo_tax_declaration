@@ -518,9 +518,12 @@ def keepz_link(tin, payer_name, note, amount):
         html, action = r.read().decode("utf-8", "replace"), r.url
     fields = {}
     for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*>', html):
-        if 'type="submit"' in m.group(0):
+        tag = m.group(0)
+        if 'type="submit"' in tag:
             continue
-        v = re.search(r'value="([^"]*)"', m.group(0))
+        if re.search(r'type="(radio|checkbox)"', tag) and 'checked' not in tag:
+            continue
+        v = re.search(r'value="([^"]*)"', tag)
         fields[m.group(1)] = v.group(1) if v else ""
     for m in re.finditer(r'<select name="([^"]+)".*?</select>', html, re.S):
         opts = re.findall(r'<option[^>]*value="([^"]*)"', m.group(0))
