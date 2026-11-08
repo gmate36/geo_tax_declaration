@@ -21,6 +21,7 @@ import urllib.request
 APP = "declare-ge"
 HOME = os.path.expanduser("~")
 OUT_ROOT = os.path.join(HOME, "declarations")
+SMALL_BUSINESS_LIMIT = 500_000.0
 
 
 def detect_chrome():
@@ -94,6 +95,24 @@ def ask(prompt):
     sys.stdout.write(prompt)
     sys.stdout.flush()
     return sys.stdin.readline().strip()
+
+
+def translate_ka_to_ru(text):
+    if not text or not text.strip():
+        return ""
+    try:
+        url = (
+            "https://translate.googleapis.com/translate_a/single?client=gtx&sl=ka&tl=ru&dt=t&q="
+            + urllib.parse.quote(text[:2000])
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+        if data and isinstance(data, list) and data[0]:
+            return "".join(part[0] for part in data[0] if part and part[0])
+    except Exception:
+        pass
+    return text
 
 
 def _load_linux_creds():
@@ -559,6 +578,13 @@ def rs_login(b):
     end = time.time() + 35
     while time.time() < end:
         if "Login.aspx" not in b.url():
+            say("rs.ge: SMS-код принят, жду загрузки кабинета...")
+            b.wait(
+                'document.readyState === "complete" && document.body && document.body.innerText.length > 0',
+                timeout=30,
+                what="загрузку кабинета rs.ge после SMS",
+            )
+            b.pump(2)
             return
 
         err = b.js(
@@ -577,18 +603,143 @@ def rs_login(b):
 
 def rs_read_mandatory(b):
     b.pump(3)
-    if not b.js('!!document.querySelector(".CloseIcon")'):
-        return
-    b.js('document.querySelector(".CloseIcon").click()')
-    for _ in range(10):
-        b.pump(2)
-        opened = b.js(
-            '(()=>{const t=[...document.querySelectorAll("h1")].filter(h=>h.offsetParent&&'
-            'parseInt(getComputedStyle(h).fontWeight)>=600&&h.closest("section"));'
-            'if(!t.length)return 0;t[0].click();return 1})()'
+    handled = 0
+    filter_requested = False
+    no_info = 0
+    max_no_info = 15
+    while no_info < max_no_info:
+        # У rs.ge уведомление бывает как в jQuery UI dialog, так и в
+        # самодельном popup с CloseIcon. Ищем сначала сам popup/кнопку
+        # закрытия, а не первый попавшийся большой div страницы.
+        info = b.js(
+            '(()=>{\n'
+            '  const visible = el => !!(el && el.getClientRects().length && el.getBoundingClientRect().width > 0 &&\n'
+            '    getComputedStyle(el).visibility !== "hidden" && getComputedStyle(el).display !== "none");\n'
+            '  const textOf = el => ((el && (el.innerText || el.textContent)) || "").trim();\n'
+            '  const close = [...document.querySelectorAll(".CloseIcon, .ui-dialog-titlebar-close, [aria-label*=lose i]")]\n'
+            '    .find(visible);\n'
+            '  const rsDialog = document.querySelector(".dialogShade .dialogContainer");\n'
+            '  if (visible(rsDialog)) {\n'
+            '    const body = rsDialog.querySelector(".dialogMessage");\n'
+            '    const heading = rsDialog.querySelector("h1, h2, h3, .ui-dialog-title");\n'
+            '    return { kind: "gate", title: textOf(heading), text: textOf(body), hasClose: !!close };\n'
+            '  }\n'
+            '  const item = [...document.querySelectorAll(".notification-container .unread-notification")]\n'
+            '    .find(el => el.querySelector("i.md-red"));\n'
+            '  if (item) {\n'
+            '    return { kind: "notification", title: textOf(item.querySelector("h1")),\n'
+            '      text: textOf(item.querySelector(".notif-text")) };\n'
+            '  }\n'
+            '  const mandatoryNav = document.querySelector("#notifications-sidebar li.mandClass");\n'
+            '  if (mandatoryNav && !mandatoryNav.classList.contains("selectedNav")) {\n'
+            '    mandatoryNav.click(); return { kind: "filter" };\n'
+            '  }\n'
+            '  const candidates = [...document.querySelectorAll(\n'
+            '    ".ui-dialog, [role=dialog], [aria-modal=true], .modal, .modal-dialog, .popup, .notification"\n'
+            '  )].filter(visible);\n'
+            '  if (close) {\n'
+            '    let el = close;\n'
+            '    for (let i = 0; i < 8 && el; i++, el = el.parentElement) {\n'
+            '      const t = textOf(el);\n'
+            '      if (t.length >= 5 && (el.querySelector("button, input, a, .CloseIcon") || i >= 2)) {\n'
+            '        candidates.push(el); break;\n'
+            '      }\n'
+            '    }\n'
+            '  }\n'
+            '  const modal = candidates.sort((a,b) => textOf(a).length - textOf(b).length)\n'
+            '    .find(el => textOf(el).length >= 5);\n'
+            '  if (!modal) return null;\n'
+            '  const text = textOf(modal);\n'
+            '  const title = (modal.querySelector("h1, h2, h3, .ui-dialog-title") || {}).innerText || "";\n'
+            '  return { title: title.trim(), text: text, hasClose: !!modal.querySelector(".CloseIcon, .ui-dialog-titlebar-close, [aria-label*=lose i]") };\n'
+            '})()'
         )
-        if not opened:
-            return
+        if not info:
+            # Angular строит этот диалог после ответа Header/ProcessNotifications.
+            # Не выходим сразу: после SMS он часто появляется через несколько секунд.
+            no_info += 1
+            b.pump(1)
+            continue
+
+        no_info = 0
+
+        if info.get("kind") == "gate":
+            # Это только технический экран кабинета, а не само уведомление.
+            # Его закрываем без вывода пользователю.
+            say("rs.ge: закрываю техническое окно уведомлений...")
+            b.js('(()=>{const e=document.querySelector(".dialogShade .CloseIcon");if(e)e.click()})()')
+            for _ in range(10):
+                b.pump(0.3)
+                if not b.js('(()=>{const e=document.querySelector(".dialogShade .dialogContainer");return !!(e&&e.getClientRects().length&&getComputedStyle(e).display!=="none"&&getComputedStyle(e).visibility!=="hidden")})()'):
+                    break
+            max_no_info = 15
+            continue
+
+        if info.get("kind") == "filter":
+            if filter_requested:
+                b.snap("mandatory-filter-not-applied")
+                raise Fail("rs.ge не переключил список на обязательные уведомления")
+            filter_requested = True
+            say("rs.ge: открываю список обязательных уведомлений...")
+            b.pump(3)
+            max_no_info = 15
+            continue
+
+        raw_title = info.get("title", "")
+        raw_text = info.get("text", "")
+
+        # Если в окне есть грузинский текст, переводим
+        title_ru = translate_ka_to_ru(raw_title) if raw_title else ""
+        text_ru = translate_ka_to_ru(raw_text[:1000])
+
+        say("\n" + "=" * 60)
+        say("⚠️  ОБНАРУЖЕНО ОБЯЗАТЕЛЬНОЕ УВЕДОМЛЕНИЕ НА rs.ge")
+        say("=" * 60)
+        if title_ru:
+            say(f"Заголовок: {title_ru}")
+        say("Содержание (RU):")
+        say(text_ru)
+        say("-" * 60)
+        say("Оригинал (KA):")
+        say(raw_text[:500] + ("..." if len(raw_text) > 500 else ""))
+        say("=" * 60)
+
+        choice = ""
+        while choice not in ("1", "2"):
+            choice = ask("Действие:\n [1] Пометить прочитанным (ознакомлен) и продолжить\n [2] Прервать работу скрипта\nВаш выбор [1/2]: ").strip()
+
+        if choice == "2":
+            raise Fail("работа прервана пользователем для проверки уведомления на eservices.rs.ge")
+
+        # Открываем именно это обязательное уведомление: клик по карточке
+        # вызывает штатный API rs.ge и переводит его из unread в read.
+        clicked = b.js(
+            '(()=>{\n'
+            '  const item = [...document.querySelectorAll(".notification-container .unread-notification")]\n'
+            '    .find(el => el.querySelector("i.md-red"));\n'
+            '  if (!item) return null;\n'
+            '  const count = document.querySelectorAll(".notification-container .unread-notification i.md-red").length;\n'
+            '  item.click(); return count;\n'
+            '})()'
+        )
+        if not clicked:
+            say("  не удалось открыть уведомление в интерфейсе rs.ge")
+        else:
+            say("  rs.ge: отмечаю уведомление прочитанным...")
+            marked_read = False
+            for _ in range(30):
+                b.pump(0.5)
+                remaining = b.js('document.querySelectorAll(".notification-container .unread-notification i.md-red").length')
+                if remaining < clicked:
+                    marked_read = True
+                    break
+            if not marked_read:
+                b.snap("mandatory-notification-not-marked")
+                raise Fail("rs.ge не отметил уведомление прочитанным после открытия; проверь карточку вручную")
+        handled += 1
+        max_no_info = 3
+
+    return handled
 
 
 def rs_english(b):
@@ -601,9 +752,18 @@ def rs_english(b):
 
 
 def rs_open_small_business(b):
-    b.go(RS_DECL, wait=4)
-    if "decl.rs.ge" not in b.url():
-        raise Fail("rs.ge не пустил в декларации: зайди на eservices.rs.ge и прочитай обязательные уведомления")
+    for attempt in range(3):
+        b.go(RS_DECL, wait=4)
+        if "decl.rs.ge" in b.url():
+            break
+        # Обязательное уведомление может появиться только после перехода
+        # в декларации. Закрываем его и повторяем переход.
+        if not rs_read_mandatory(b):
+            b.snap("decl-redirect-blocked")
+            raise Fail("rs.ge не пустил в декларации: зайди на eservices.rs.ge и прочитай обязательные уведомления")
+    else:
+        b.snap("decl-redirect-blocked")
+        raise Fail("rs.ge не пустил в декларации после обработки обязательных уведомлений")
     b.wait('typeof go_g3==="function"', timeout=30, what="раздел деклараций")
     b.js(f'go_g3("{SMALL_BUSINESS}","1")')
     b.wait(
@@ -657,8 +817,7 @@ def rs_fill(b, income_str):
     b.js(
         '(()=>{const i=document.querySelector("[id^=control_][id$=_20]");i.focus();'
         f'i.value="{income_str}";["input","change","keyup","blur"].forEach(t=>'
-        'i.dispatchEvent(new Event(t,{bubbles:true})))})()'
-    )
+        'i.dispatchEvent(new Event(t,{bubbles:true})))})()')
     b.pump(2)
     return json.loads(
         b.js(
@@ -822,10 +981,11 @@ def run(args):
                 raise Fail(f"rs.ge открыл декларацию за {period}, а считаем {year}-{month:02d}")
             got = rs_fill(b, income_str)
             b.snap("rs-form")
-            say(f"К подаче за {label}:")
-            say(f"  поле 20, доход за месяц: {got['20']:.2f}")
-            say(f"  поле 15, с начала года: {got['15']:.2f}")
-            say(f"  налог: {got['26']:.2f}")
+
+            # Расчет прогноза поля 15 на следующий месяц
+            cumulative_before = float(got["15"] or 0.0)
+            cumulative_after = cumulative_before + float(got["20"] or 0.0)
+            remaining_limit = max(0.0, SMALL_BUSINESS_LIMIT - cumulative_after)
 
             if abs(got["20"] - income_gel) > 0.005 or abs(got["26"] - tax) > 0.005:
                 raise Fail(
@@ -833,16 +993,38 @@ def run(args):
                     f"получили {got['20']:.2f} и {got['26']:.2f})"
                 )
 
+            # Вывод сводки данных перед подачей
+            say("\n" + "=" * 60)
+            say(f"СВОДКА К ПОДАЧЕ ДЕКЛАРАЦИИ ЗА {label}")
+            say("=" * 60)
+            say("Поступления:")
+            for inc in incomes:
+                gel_val = inc["amount"] * inc["rate"]
+                say(f"  • {inc['date']}: {inc['amount']:,.2f} {inc['currency']} (курс {inc['rate']:.4f}) = {gel_val:,.2f} GEL")
+            say("-" * 60)
+            say(f"Поле 20 (доход за текущий месяц):       {got['20']:,.2f} GEL")
+            say(f"Поле 15 (накоплено до этого месяца):     {cumulative_before:,.2f} GEL")
+            say(f"Прогноз поля 15 на след. месяц (15+20):  {cumulative_after:,.2f} GEL")
+            if cumulative_after > SMALL_BUSINESS_LIMIT:
+                say(f"⚠️  ВНИМАНИЕ: превышен лимит 500,000 GEL (превышение: {cumulative_after - SMALL_BUSINESS_LIMIT:,.2f} GEL)!")
+            else:
+                say(f"Остаток до лимита 500,000 GEL:          {remaining_limit:,.2f} GEL")
+            say(f"Поле 26 (налог к уплате 1%):             {got['26']:,.2f} GEL")
+            say(f"Номер черновика:                         {seq}")
+            say("=" * 60 + "\n")
+
             if args.dry_run:
-                say("\n--dry-run: не отправляю, черновик оставлен сохранённым на rs.ge.")
+                say("--dry-run: не отправляю, черновик сохранён на rs.ge.")
                 rs_click_text(b, "Save")
                 b.pump(3)
                 return 0
-            if ask("Подать? [y/N] ").lower() != "y":
+
+            if ask("Подать декларацию? [y/N]: ").strip().lower() != "y":
                 rs_click_text(b, "Save")
                 b.pump(3)
-                say("Не подано, черновик сохранён на rs.ge.")
+                say(f"\nДекларация НЕ отправлена. Черновик (номер {seq}) сохранён на rs.ge.")
                 return 0
+
             rs_click_text(b, "Next")
             b.pump(4)
             rs_click_text(b, "Send")
